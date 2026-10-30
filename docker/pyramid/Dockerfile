@@ -9,6 +9,7 @@ ENV VIRTUAL_ENV=/opt/venv
 RUN useradd -u 1444 -m snovault
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
     curl \
     gcc \
     git \
