@@ -157,34 +157,78 @@ def get_current_index_names(type_alias_to_current_index_name):
     ]
 
 
-def delete_old_indices_if_empty(props: ManageMappingsProps):
+def get_type_aliases(props: ManageMappingsProps, index_aliases):
+    # Every index we create carries its type alias plus the shared resources
+    # alias. Strip the shared one to get the type alias(es) of an index.
+    return sorted(
+        alias
+        for alias in index_aliases
+        if alias != props.all_resources_alias
+    )
+
+
+def has_only_unregistered_types(props: ManageMappingsProps, type_aliases):
+    return all(
+        type_alias not in props.type_alias_to_current_index_name
+        for type_alias in type_aliases
+    )
+
+
+def delete_index(props: ManageMappingsProps, index):
+    print(
+        props.opensearch_client.indices.delete(
+            index=index,
+            ignore=[400, 404],
+        )
+    )
+
+
+def delete_old_indices(props: ManageMappingsProps):
     current_index_names = get_current_index_names(
         props.type_alias_to_current_index_name
     )
-    all_existing_resources_indices = list(
-        sorted(
-            props.opensearch_client.indices.get_alias(
-                props.all_resources_alias
-            ).keys()
-        )
+    all_existing_resources_indices = props.opensearch_client.indices.get_alias(
+        props.all_resources_alias
     )
-    for existing_index in all_existing_resources_indices:
+    for existing_index in sorted(all_existing_resources_indices):
         if existing_index in current_index_names:
             print(f'Not deleting current index {existing_index}')
+            continue
+        type_aliases = get_type_aliases(
+            props,
+            all_existing_resources_indices[existing_index].get('aliases', {}),
+        )
+        if not type_aliases:
+            # Not an index we created. Leave it alone but make it visible.
+            print(f'{existing_index} has no type alias, skipping delete')
+            props.summary['skipped_no_type_alias'].append(existing_index)
+            continue
+        if has_only_unregistered_types(props, type_aliases):
+            # The type was removed or renamed. No reindex will ever move its
+            # documents into a current index, so without this the index would
+            # stay in the resources alias forever and keep feeding stale
+            # documents to invalidation.
+            print(
+                f'{existing_index} belongs to unregistered type(s) '
+                f'{type_aliases}, deleting'
+            )
+            delete_index(props, existing_index)
+            props.summary['deleted_removed_types'].append(existing_index)
             continue
         documents_in_index = props.opensearch_client.count(index=existing_index)['count']
         if documents_in_index != 0:
             print(f'{existing_index} is not latest but still has documents, skipping delete')
+            props.summary['skipped_not_empty'].append(existing_index)
             continue
         print(f'Deleting {existing_index}')
-        print(props.opensearch_client.indices.delete(index=existing_index, ignore=[400, 404]))
+        delete_index(props, existing_index)
         props.summary['deleted'].append(existing_index)
 
 
 def update(props: ManageMappingsProps):
     clean_up_auto_created_indices(props)
     create_latest_indices_and_reindex(props)
-    delete_old_indices_if_empty(props)
+    delete_old_indices(props)
 
 
 def get_type_alias_to_current_index_name(app):
@@ -204,6 +248,18 @@ def get_mappings(relative_mapping_directory, type_alias_to_current_index_name):
     return mappings
 
 
+def make_summary():
+    return {
+        'created': [],
+        'deleted': [],
+        'deleted_removed_types': [],
+        'reindexed': [],
+        'cleaned_up': [],
+        'skipped_not_empty': [],
+        'skipped_no_type_alias': [],
+    }
+
+
 def manage_mappings(app, relative_mapping_directory, should_reindex='never'):
     type_alias_to_current_index_name = get_type_alias_to_current_index_name(app)
     mappings = get_mappings(
@@ -217,12 +273,7 @@ def manage_mappings(app, relative_mapping_directory, should_reindex='never'):
         mappings=mappings,
         all_resources_alias=ALL_RESOURCES_ALIAS,
         should_reindex=should_reindex,
-        summary={
-            'created': [],
-            'deleted': [],
-            'reindexed': [],
-            'cleaned_up': [],
-        }
+        summary=make_summary(),
     )
     update(props)
     return props.summary
