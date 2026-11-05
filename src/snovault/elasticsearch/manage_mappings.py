@@ -121,24 +121,36 @@ def clean_up_auto_created_indices(props: ManageMappingsProps):
             )
 
 
-def should_reindex_collection(props: ManageMappingsProps, type_alias):
+def resources_alias_exists(props: ManageMappingsProps):
+    return bool(
+        props.opensearch_client.indices.exists_alias(
+            name=props.all_resources_alias,
+        )
+    )
+
+
+def should_reindex_collection(props: ManageMappingsProps, resources_alias_existed):
     if props.should_reindex == 'never':
         return False
     elif props.should_reindex == 'always':
         return True
     elif props.should_reindex == 'after-initial':
-        try:
-            return len(props.opensearch_client.indices.get_alias(type_alias)) > 0
-        except Exception:
-            return False
+        # Reindex unless this run is the one creating the cluster's first
+        # indices. This used to look for the type's own alias instead, which
+        # breaks for a type whose index delete_old_indices removed earlier
+        # (gone in one release or branch, back in the next): its alias is
+        # gone too, so the type was created empty and never reindexed.
+        return resources_alias_existed
 
 
 def create_latest_indices_and_reindex(props: ManageMappingsProps):
+    # Decide once, before this run creates any index.
+    resources_alias_existed = resources_alias_exists(props)
     collections_to_reindex = []
     for type_alias, current_index_name in props.type_alias_to_current_index_name.items():
         if not props.opensearch_client.indices.exists(current_index_name):
             # Check before creating new index.
-            if should_reindex_collection(props, type_alias):
+            if should_reindex_collection(props, resources_alias_existed):
                 collections_to_reindex.append(type_alias)
             create_index(
                 props=props,
@@ -187,8 +199,12 @@ def delete_old_indices(props: ManageMappingsProps):
     current_index_names = get_current_index_names(
         props.type_alias_to_current_index_name
     )
+    # This must stay the index= form (GET /<alias>/_alias), which returns
+    # every alias of each index behind the resources alias. The name= form
+    # (GET /_alias/<alias>) returns only the resources alias itself and would
+    # hide the type aliases the classification below depends on.
     all_existing_resources_indices = props.opensearch_client.indices.get_alias(
-        props.all_resources_alias
+        index=props.all_resources_alias,
     )
     for existing_index in sorted(all_existing_resources_indices):
         if existing_index in current_index_names:
@@ -198,12 +214,7 @@ def delete_old_indices(props: ManageMappingsProps):
             props,
             all_existing_resources_indices[existing_index].get('aliases', {}),
         )
-        if not type_aliases:
-            # Not an index we created. Leave it alone but make it visible.
-            print(f'{existing_index} has no type alias, skipping delete')
-            props.summary['skipped_no_type_alias'].append(existing_index)
-            continue
-        if has_only_unregistered_types(props, type_aliases):
+        if type_aliases and has_only_unregistered_types(props, type_aliases):
             # The type was removed or renamed. No reindex will ever move its
             # documents into a current index, so without this the index would
             # stay in the resources alias forever and keep feeding stale
@@ -215,10 +226,18 @@ def delete_old_indices(props: ManageMappingsProps):
             delete_index(props, existing_index)
             props.summary['deleted_removed_types'].append(existing_index)
             continue
+        # Either an older index of a registered type, or an index with no type
+        # alias at all: the legacy create-mapping command only set the
+        # resources alias, and someone may have made one by hand. We can't
+        # tell what the latter holds, so both keep the old rule: delete once
+        # empty, otherwise leave it and report it.
         documents_in_index = props.opensearch_client.count(index=existing_index)['count']
         if documents_in_index != 0:
             print(f'{existing_index} is not latest but still has documents, skipping delete')
-            props.summary['skipped_not_empty'].append(existing_index)
+            if type_aliases:
+                props.summary['skipped_not_empty'].append(existing_index)
+            else:
+                props.summary['skipped_no_type_alias'].append(existing_index)
             continue
         print(f'Deleting {existing_index}')
         delete_index(props, existing_index)
